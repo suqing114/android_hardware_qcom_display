@@ -286,6 +286,13 @@ DisplayError DisplayBuiltIn::PrePrepare(LayerStack *layer_stack) {
   }
   error = ChangeFps();
   lower_fps_ = disp_layer_stack_->info.lower_fps;
+  uint32_t frame = 0;
+  if (error != kErrorNone && error != kErrorNotSupported &&
+      hw_intf_->GetFeatureSupportStatus(kFrameConfig, &frame) == kErrorNone) {
+    validated_ = false;
+    needs_validate_ = true;
+    return error;
+  }
 
   return kErrorNotValidated;
 }
@@ -324,6 +331,9 @@ DisplayError DisplayBuiltIn::Prepare(LayerStack *layer_stack) {
   if (error == kErrorNeedsLutRegen && (ForceToneMapUpdate(layer_stack) == kErrorNone)) {
     return kErrorNone;
   }
+  if (error != kErrorNotValidated && error != kErrorNeedsLutRegen) {
+    return error;
+  }
 
   error = HandleSPR();
   if (error != kErrorNone) {
@@ -332,6 +342,16 @@ DisplayError DisplayBuiltIn::Prepare(LayerStack *layer_stack) {
 
   error = DisplayBase::Prepare(layer_stack);
   if (error != kErrorNone) {
+    uint32_t frame = 0, active = 0;
+    if (hw_intf_->GetFeatureSupportStatus(kFrameConfig, &frame) == kErrorNone &&
+        hw_intf_->GetActiveConfig(&active) == kErrorNone && frame != active) {
+      DisplayError restore = RestoreActiveRefreshRate(active);
+      validated_ = false;
+      needs_validate_ = true;
+      if (restore != kErrorNone) {
+        return restore;
+      }
+    }
     return error;
   }
 
@@ -1273,9 +1293,12 @@ DisplayError DisplayBuiltIn::SetRefreshRate(uint32_t refresh_rate, bool final_ra
       return error;
     }
 
-    error = comp_manager_->CheckEnforceSplit(display_comp_ctx_, refresh_rate);
-    if (error != kErrorNone) {
-      return error;
+    uint32_t frame = 0;
+    if (hw_intf_->GetFeatureSupportStatus(kFrameConfig, &frame) != kErrorNone) {
+      error = comp_manager_->CheckEnforceSplit(display_comp_ctx_, refresh_rate);
+      if (error != kErrorNone) {
+        return error;
+      }
     }
   }
 
@@ -1288,7 +1311,7 @@ DisplayError DisplayBuiltIn::SetRefreshRate(uint32_t refresh_rate, bool final_ra
   current_refresh_rate_ = refresh_rate;
   deferred_config_.MarkDirty();
 
-  return ReconfigureDisplay();
+  return ReconfigureRefreshRate(false);
 }
 
 bool DisplayBuiltIn::CanLowerFps(bool idle_screen) {
@@ -2388,8 +2411,52 @@ DisplayError DisplayBuiltIn::BuildLayerStackStats(LayerStack *layer_stack) {
 }
 
 DisplayError DisplayBuiltIn::SetActiveConfig(uint32_t index) {
+  ClientLock lock(disp_mutex_);
+  uint32_t frame = 0, active = 0;
+  if (hw_intf_->GetFeatureSupportStatus(kFrameConfig, &frame) == kErrorNone &&
+      hw_intf_->GetActiveConfig(&active) == kErrorNone && index == active && frame != active) {
+    // DisplayBase treats a request for the committed config as a no-op.
+    DisplayError error = RestoreActiveRefreshRate(active);
+    if (error != kErrorNone) {
+      return error;
+    }
+  }
   deferred_config_.MarkDirty();
-  return DisplayBase::SetActiveConfig(index);
+  DisplayError error = DisplayBase::SetActiveConfig(index);
+  if (error == kErrorNone && hw_intf_->GetFeatureSupportStatus(kFrameConfig, &frame) == kErrorNone) {
+    current_refresh_rate_ = active_refresh_rate_;
+  }
+  return error;
+}
+
+DisplayError DisplayBuiltIn::ReconfigureRefreshRate(bool allow_fallback) {
+  DisplayError error = ReconfigureDisplay();
+  uint32_t frame = 0, active = 0;
+  if (error == kErrorNone || hw_intf_->GetFeatureSupportStatus(kFrameConfig, &frame) != kErrorNone ||
+      hw_intf_->GetActiveConfig(&active) != kErrorNone || frame == active) {
+    return error;
+  }
+  DisplayError restore = RestoreActiveRefreshRate(active);
+  if (restore != kErrorNone) {
+    validated_ = false;
+    needs_validate_ = true;
+    return restore;
+  }
+  return allow_fallback ? kErrorNone : error;
+}
+
+DisplayError DisplayBuiltIn::RestoreActiveRefreshRate(uint32_t active) {
+  HWDisplayAttributes attributes;
+  DisplayError error = hw_intf_->GetDisplayAttributes(active, &attributes);
+  if (error == kErrorNone) {
+    error = hw_intf_->SetRefreshRate(attributes.fps);
+  }
+  if (error != kErrorNone) {
+    return error;
+  }
+  current_refresh_rate_ = attributes.fps;
+  deferred_config_.MarkDirty();
+  return ReconfigureDisplay();
 }
 
 DisplayError DisplayBuiltIn::ReconfigureDisplay() {
@@ -2401,7 +2468,10 @@ DisplayError DisplayBuiltIn::ReconfigureDisplay() {
 
   DTRACE_SCOPED();
 
-  error = hw_intf_->GetActiveConfig(&active_index);
+  bool fixed_clock_video = hw_intf_->GetFeatureSupportStatus(kFrameConfig, &active_index) == kErrorNone;
+  if (!fixed_clock_video) {
+    error = hw_intf_->GetActiveConfig(&active_index);
+  }
   if (error != kErrorNone) {
     return error;
   }
@@ -2409,6 +2479,10 @@ DisplayError DisplayBuiltIn::ReconfigureDisplay() {
   error = hw_intf_->GetDisplayAttributes(active_index, &display_attributes);
   if (error != kErrorNone) {
     return error;
+  }
+  if (fixed_clock_video) {
+    // The DAL drops a rejected commit. Let the next draw request its rate again.
+    current_refresh_rate_ = display_attributes.fps;
   }
 
   error = hw_intf_->GetMixerAttributes(&mixer_attributes);
@@ -3001,9 +3075,12 @@ DisplayError DisplayBuiltIn::ChangeFps() {
       return error;
     }
 
-    error = comp_manager_->CheckEnforceSplit(display_comp_ctx_, refresh_rate);
-    if (error != kErrorNone) {
-      return error;
+    uint32_t frame = 0;
+    if (hw_intf_->GetFeatureSupportStatus(kFrameConfig, &frame) != kErrorNone) {
+      error = comp_manager_->CheckEnforceSplit(display_comp_ctx_, refresh_rate);
+      if (error != kErrorNone) {
+        return error;
+      }
     }
   }
 
@@ -3017,7 +3094,7 @@ DisplayError DisplayBuiltIn::ChangeFps() {
   current_refresh_rate_ = refresh_rate;
   deferred_config_.MarkDirty();
 
-  return ReconfigureDisplay();
+  return ReconfigureRefreshRate(true);
 }
 
 bool DisplayBuiltIn::IdleFallbackLowerFps(bool idle_screen) {

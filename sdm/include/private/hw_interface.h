@@ -94,6 +94,7 @@ enum HWFeature {
   kHasCwbCrop,
   kHasDedicatedCwb,
   kMaxSupportedCwb,
+  kFrameConfig,  // Mode used for resource allocation on the next frame.
 };
 
 // HWEventHandler - Implemented in DisplayBase and HWInterface implementation

@@ -1044,6 +1044,39 @@ DisplayError HWDeviceDRM::GetActiveConfig(uint32_t *active_config) {
   return kErrorNone;
 }
 
+bool HWDeviceDRM::IsFixedClockVideo() const {
+  if (hw_panel_info_.port != kPortDSI || !hw_panel_info_.dynamic_fps ||
+      hw_panel_info_.dyn_bitclk_support || hw_panel_info_.mode != kModeVideo ||
+      switch_mode_valid_ || panel_mode_changed_) {
+    return false;
+  }
+  const auto &active = connector_info_.modes[current_mode_index_];
+  if (!active.default_bit_clk_rate || active.sub_modes.size() != 1) {
+    return false;
+  }
+  // Only a refresh change on a single fixed link/topology can reuse the
+  // committed panel and mixer configuration for the transition frame.
+  for (const auto &mode : connector_info_.modes) {
+    if (mode.default_bit_clk_rate != active.default_bit_clk_rate ||
+        mode.mode.hdisplay != active.mode.hdisplay || mode.mode.vdisplay != active.mode.vdisplay ||
+        mode.transfer_time_us != active.transfer_time_us || mode.sub_modes.size() != 1 ||
+        mode.sub_modes[0].panel_mode_caps != DRM_MODE_FLAG_VID_MODE_PANEL ||
+        mode.sub_modes[0].panel_compression_mode != active.curr_compression_mode ||
+        mode.sub_modes[0].topology != active.sub_modes[0].topology) {
+      return false;
+    }
+  }
+  return true;
+}
+
+uint32_t HWDeviceDRM::GetFrameModeIndex() const {
+  uint32_t index = current_mode_index_, submode = 0;
+  if (vrefresh_ && IsFixedClockVideo()) {
+    FindRefreshRateMode(vrefresh_, &index, &submode);
+  }
+  return index;
+}
+
 DisplayError HWDeviceDRM::GetNumDisplayAttributes(uint32_t *count) {
   *count = UINT32(display_attributes_.size());
   return kErrorNone;
@@ -1155,6 +1188,10 @@ DisplayError HWDeviceDRM::SetDisplayAttributes(uint32_t index) {
     return kErrorParameters;
   }
 
+  if (vrefresh_ && IsFixedClockVideo()) {
+    // An explicit config supersedes an autonomous refresh queued for this frame.
+    vrefresh_ = 0;
+  }
   SetDisplaySwitchMode(index);
   PopulateHWPanelInfo();
   UpdateMixerAttributes();
@@ -1405,7 +1442,7 @@ void HWDeviceDRM::SetupAtomic(Fence::ScopedRef &scoped_ref, HWLayersInfo *hw_lay
   uint32_t hw_layer_count = UINT32(hw_layers_info->hw_layers.size());
   HWQosData &qos_data = hw_layers_info->qos_data;
   DRMSecurityLevel crtc_security_level = DRMSecurityLevel::SECURE_NON_SECURE;
-  uint32_t index = current_mode_index_;
+  uint32_t index = GetFrameModeIndex();
   sde_drm::DRMModeInfo current_mode = connector_info_.modes[index];
 
   solid_fills_.clear();
@@ -1628,8 +1665,10 @@ void HWDeviceDRM::SetupAtomic(Fence::ScopedRef &scoped_ref, HWLayersInfo *hw_lay
   if (update_config) {
     SetSolidfillStages();
     ApplyNoiseLayerConfig();
-    SetQOSData(qos_data);
     drm_atomic_intf_->Perform(DRMOps::CRTC_SET_SECURITY_LEVEL, token_.crtc_id, crtc_security_level);
+  }
+  if (update_config || index != current_mode_index_) {
+    SetQOSData(qos_data);
   }
 
   if (hw_layers_info->hw_avr_info.update) {
@@ -1696,7 +1735,7 @@ void HWDeviceDRM::SetupAtomic(Fence::ScopedRef &scoped_ref, HWLayersInfo *hw_lay
            qos_data.rot_prefill_bw_bps / 1000.f, qos_data.rot_clock_hz);
 
   // Set refresh rate
-  if (vrefresh_) {
+  if (vrefresh_ && !IsFixedClockVideo()) {
     for (uint32_t mode_index = 0; mode_index < connector_info_.modes.size(); mode_index++) {
       if ((current_mode.mode.vdisplay == connector_info_.modes[mode_index].mode.vdisplay) &&
           (current_mode.mode.hdisplay == connector_info_.modes[mode_index].mode.hdisplay) &&
@@ -1843,7 +1882,9 @@ DisplayError HWDeviceDRM::Validate(HWLayersInfo *hw_layers_info) {
   if (ret) {
     DLOGE("failed with error %d for %s", ret, device_name_);
     DumpHWLayers(hw_layers_info);
-    vrefresh_ = 0;
+    if (GetFrameModeIndex() == current_mode_index_) {
+      vrefresh_ = 0;
+    }
     panel_mode_changed_ = 0;
     seamless_mode_switch_ = false;
     panel_compression_changed_ = 0;
@@ -1931,7 +1972,7 @@ DisplayError HWDeviceDRM::AtomicCommit(HWLayersInfo *hw_layers_info) {
   bool sync_commit = synchronous_commit_ || first_cycle_;
 
   if (hw_layers_info->elapse_timestamp > 0 || hw_layers_info->expected_present_time > 0) {
-    uint64_t vsync_period = display_attributes_[current_mode_index_].vsync_period_ns;
+    uint64_t vsync_period = display_attributes_[GetFrameModeIndex()].vsync_period_ns;
     uint64_t expected_present_time = hw_layers_info->expected_present_time > 0 ?
                                      hw_layers_info->expected_present_time - vsync_period : 0;
     uint64_t future_timestamp = std::max(hw_layers_info->elapse_timestamp, expected_present_time);
@@ -1977,7 +2018,11 @@ DisplayError HWDeviceDRM::AtomicCommit(HWLayersInfo *hw_layers_info) {
 
   hw_layers_info->sync_handle = release_fence;
 
-  if (vrefresh_) {
+  uint32_t frame_index = GetFrameModeIndex();
+  if (frame_index != current_mode_index_) {
+    current_mode_index_ = frame_index;
+    vrefresh_ = 0;
+  } else if (vrefresh_) {
     // Update current mode index if refresh rate is changed
     drmModeModeInfo current_mode = connector_info_.modes[current_mode_index_].mode;
     for (uint32_t mode_index = 0; mode_index < connector_info_.modes.size(); mode_index++) {
@@ -2329,8 +2374,20 @@ DisplayError HWDeviceDRM::SetRefreshRate(uint32_t refresh_rate) {
     return kErrorNotSupported;
   }
 
-  // Check if requested refresh rate is valid
-  sde_drm::DRMModeInfo current_mode = connector_info_.modes[current_mode_index_];
+  uint32_t index = 0, submode = 0;
+  if (!FindRefreshRateMode(refresh_rate, &index, &submode)) {
+    return kErrorNotSupported;
+  }
+  auto &mode = connector_info_.modes[index];
+  mode.curr_submode_index = submode;
+  vrefresh_ = index == current_mode_index_ && IsFixedClockVideo() ? 0 : refresh_rate;
+  DLOGV_IF(kTagDriverConfig, "Set refresh rate to %d", refresh_rate);
+  return kErrorNone;
+}
+
+bool HWDeviceDRM::FindRefreshRateMode(uint32_t refresh_rate, uint32_t *index,
+                                      uint32_t *submode) const {
+  const auto &current_mode = connector_info_.modes[current_mode_index_];
   for (uint32_t mode_index = 0; mode_index < connector_info_.modes.size(); mode_index++) {
     if ((current_mode.mode.vdisplay == connector_info_.modes[mode_index].mode.vdisplay) &&
         (current_mode.mode.hdisplay == connector_info_.modes[mode_index].mode.hdisplay) &&
@@ -2340,15 +2397,14 @@ DisplayError HWDeviceDRM::SetRefreshRate(uint32_t refresh_rate) {
            connector_info_.modes[mode_index].sub_modes.size(); submode_idx++) {
         sde_drm::DRMSubModeInfo sub_mode = connector_info_.modes[mode_index].sub_modes[submode_idx];
         if (sub_mode.panel_compression_mode == current_mode.curr_compression_mode) {
-          connector_info_.modes[mode_index].curr_submode_index = submode_idx;
-          vrefresh_ = refresh_rate;
-          DLOGV_IF(kTagDriverConfig, "Set refresh rate to %d", refresh_rate);
-          return kErrorNone;
+          *index = mode_index;
+          *submode = submode_idx;
+          return true;
         }
       }
     }
   }
-  return kErrorNotSupported;
+  return false;
 }
 
 
@@ -3345,6 +3401,12 @@ DisplayError HWDeviceDRM::GetFeatureSupportStatus(const HWFeature feature, uint3
       break;
     case kMaxSupportedCwb:
       *status = max_cwb_;
+      break;
+    case kFrameConfig:
+      if (!IsFixedClockVideo()) {
+        return kErrorNotSupported;
+      }
+      *status = GetFrameModeIndex();
       break;
     default:
       DLOGW("Unable to get status of feature : %d", feature);

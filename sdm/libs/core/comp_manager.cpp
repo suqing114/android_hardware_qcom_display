@@ -299,9 +299,8 @@ DisplayError CompManager::ReconfigureDisplay(Handle comp_handle,
     if (error != kErrorNone) {
       DLOGE("Unable to Reconfigure strategy on display %d-%d.", display_comp_ctx->display_id,
             display_comp_ctx->display_type);
-      display_comp_ctx->strategy->Deinit();
-      delete display_comp_ctx->strategy;
-      display_comp_ctx->strategy = NULL;
+      // The next prepare, or a rollback to the previous config, still needs
+      // the registered strategy.
       return error;
     }
   }

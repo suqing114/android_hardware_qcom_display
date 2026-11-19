@@ -189,6 +189,8 @@ class DisplayBuiltIn : public DisplayBase, HWEventHandler, DppsPropIntf {
   void AppendCWBLayer(LayerStack *layer_stack);
   uint32_t GetUpdatingAppLayersCount(LayerStack *layer_stack);
   DisplayError ChangeFps();
+  DisplayError RestoreActiveRefreshRate(uint32_t active);
+  DisplayError ReconfigureRefreshRate(bool allow_fallback);
   uint32_t GetUpdatingLayersCount();
   uint32_t GetOptimalRefreshRate(bool one_updating_layer);
   uint32_t CalculateMetaDataRefreshRate();

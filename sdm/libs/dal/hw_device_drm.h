@@ -111,6 +111,7 @@ class HWDeviceDRM : public HWInterface {
   virtual DisplayError Deinit();
   void GetDRMDisplayToken(sde_drm::DRMDisplayToken *token) const;
   bool IsPrimaryDisplay() const { return hw_panel_info_.is_primary_panel; }
+  uint32_t GetFrameModeIndex() const;
   virtual PanelFeaturePropertyIntf *GetPanelFeaturePropertyIntf() { return nullptr; }
   virtual DisplayError GetPanelBrightnessBasePath(std::string *base_path) const {
     return kErrorNotSupported;
@@ -311,6 +312,8 @@ class HWDeviceDRM : public HWInterface {
 
  protected:
   void SetDisplaySwitchMode(uint32_t index);
+  bool IsFixedClockVideo() const;
+  bool FindRefreshRateMode(uint32_t fps, uint32_t *index, uint32_t *submode) const;
   bool IsSeamlessTransition() {
     return (hw_panel_info_.dynamic_fps && (vrefresh_ || seamless_mode_switch_)) ||
      panel_mode_changed_ || bit_clk_rate_;
