@@ -1073,7 +1073,6 @@ void HWDeviceDRM::SetDisplaySwitchMode(uint32_t index) {
   uint32_t curr_mode_flag = 0, switch_mode_flag = 0;
   sde_drm::DRMModeInfo to_set = connector_info_.modes[index];
   sde_drm::DRMModeInfo current_mode = connector_info_.modes[current_mode_index_];
-  uint64_t target_bit_clk = connector_info_.modes[current_mode_index_].curr_bit_clk_rate;
   uint32_t target_compression = connector_info_.modes[current_mode_index_].curr_compression_mode;
   uint32_t switch_index  = 0;
 
@@ -1106,7 +1105,6 @@ void HWDeviceDRM::SetDisplaySwitchMode(uint32_t index) {
         if (sub_mode.panel_compression_mode == target_compression) {
           connector_info_.modes[mode_index].curr_submode_index = submode_idx;
           index = mode_index;
-          to_set.curr_bit_clk_rate = GetSupportedBitClkRate(index, target_bit_clk);
           break;
         }
       }
