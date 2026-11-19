@@ -799,6 +799,7 @@ void DRMConnector::ParseModeProperties(uint64_t blob_id, DRMConnectorInfo *info)
   DRMSubModeInfo *submode_item = NULL;
   unsigned int index = 0;
   unsigned int submode_index = 0;
+  std::map<int, uint32_t> submode_indices;
 
   while (std::getline(stream, line)) {
     if (line.find(mode_name) != string::npos) {
@@ -810,14 +811,18 @@ void DRMConnector::ParseModeProperties(uint64_t blob_id, DRMConnectorInfo *info)
       mode_item = &info->modes.at(index++);
       submode_item = NULL;
       submode_index = 0;
-    } else if (line.find(submode_string) != string::npos) {
-      string submode_idx(line, submode_string.length());
+      submode_indices.clear();
+    } else if (line.compare(0, submode_string.length(), submode_string) == 0) {
+      // The kernel uses IDs from its panel-wide mode table.
+      submode_indices[std::stoi(line.substr(submode_string.length()))] = mode_item->sub_modes.size();
       DRMSubModeInfo submode = {};
       mode_item->sub_modes.push_back(submode);
-      submode_item = &mode_item->sub_modes.at(submode_index++);
-    } else if (line.find(preferred_submode_string) != string::npos) {
-      mode_item->curr_submode_index =
-                 std::stoi(string(line, preferred_submode_string.length()));
+      submode_item = &mode_item->sub_modes.back();
+    } else if (line.compare(0, preferred_submode_string.length(), preferred_submode_string) == 0) {
+      auto preferred = submode_indices.find(std::stoi(line.substr(preferred_submode_string.length())));
+      if (preferred != submode_indices.end()) {
+        mode_item->curr_submode_index = preferred->second;
+      }
     } else if (line.find(topology) != string::npos) {
       if (!submode_item) {
         DRMSubModeInfo submode = {};
